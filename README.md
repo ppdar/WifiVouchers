@@ -1,4 +1,4 @@
-Small pfSense utility that will print Wifi Vouchers to a esc/POS thermal printer.
+Small pfSense utility written in Python32 that will print Wifi Vouchers to a esc/POS thermal printer.
 Go to PfSense webGUI/Captive Portal and create Wifi Vouchers then choose menu option to export to a CSV file and save the file into the same directory as WifiVouchers.py
 Launch WifiVouchers and simply click on Print Voucher. A messagebox will prompt you to confirm the voucher printed successfully (in case of paper jam etc.).
 Clicking YES will delete the voucher number from the file and the next time a new voucher number will be printed. Clicking NO will not remove the voucher number from the csv file and instead allow you to print the last voucher number.
