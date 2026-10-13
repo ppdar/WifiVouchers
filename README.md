@@ -1,6 +1,6 @@
 Small pfSense utility written in Python32 that will print Wifi Vouchers to a esc/POS thermal printer.
 
-WifiVouchers reqires that you "pre-load" the application with voucher codes from a CSV file generated in the Captive Portal. Go to PfSense webGUI/Captive Portal and create Wifi Voucher rolls then choose menu option to export those rolls to CSV file and then copy over the csv file into the same directory as WifiVouchers.
+WifiVouchers requires that you "pre-load" the application with voucher codes from a CSV file generated in the Captive Portal. Go to PfSense webGUI/Captive Portal and create Wifi Voucher rolls then choose menu option to export those rolls to CSV file and then copy over the csv file into the same directory as WifiVouchers.
 
 Launch WifiVouchers and simply click on Print Voucher. A messagebox will prompt you to confirm the voucher printed successfully (in case of paper jam etc.).
 Clicking YES will delete the voucher number from the CSV file and next time a new voucher number will be printed. Clicking CANCEL will not delete the voucher from the csv file and instead allow you to print the last voucher number again.
