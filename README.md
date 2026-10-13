@@ -9,5 +9,5 @@ The ini file must be present in the current directory. The name of the printer m
 
 
 Additional Notes:
-Each voucher roll in pfSense can have a maximum of 65,554 codes. Creating 10 rolls on pfSense gui and joining them together into one large csv file would potentially mean 0.7m codes available before requiring new roll generation. Be aware that loading 0.7m codes into the application would slow the loading and printing of codes.
+Each voucher roll in pfSense can have a maximum of 65,554 codes. Creating 10 rolls in pfSense captive portal and then joining those rolls into one large csv file could potentially mean 0.7m codes available before requiring new roll generation. Be aware that loading 0.7m codes into the application would slow the loading and printing of codes.
 
