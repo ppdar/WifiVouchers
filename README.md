@@ -8,4 +8,4 @@ Clicking YES will delete the voucher number from the file and the next time a ne
 Pre-requisites: The ini file must be present in the current directory. The name of the printer in the ini file must match the name of the esc/POS printer listed in the Windows Printer & scanners list.
 
 Additional Notes:
-Each voucher roll in pfSense can have a maximum of 65,554 codes. Creating 10 rolls in pfSense captive portal and then joining those rolls into one large csv file could potentially mean 0.7m codes pre-loaded into the app before requiring new roll generation. Be aware that pre-loading 0.7m voucher codes would slow the app considerably.
+Each voucher roll in pfSense can have a maximum of 65,535 codes. Creating 10 rolls in pfSense captive portal and then joining those rolls into one large csv file could potentially mean 0.7m codes pre-loaded into the app before requiring new roll generation. Be aware that pre-loading 0.7m voucher codes would slow the app considerably.
