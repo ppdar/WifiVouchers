@@ -10,4 +10,4 @@ You can import multiple fresh voucher rolls into WifiVouchers. Each voucher roll
 
 To compact the database set the compact_database in the INI file to true and the next time you start WifiVouchers.exe it will compact the database once and set the INI value back to false.
 
-WifiVouchers was tested on Windows 10 but should also work on Windows 11 and other earlier versions.
+WifiVouchers was tested on Windows 10 but should also work on Windows 11 and earlier versions.
