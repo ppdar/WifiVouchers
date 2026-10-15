@@ -1,32 +1,43 @@
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 
-# Standard-library tools for Windows integration, file handling, and voucher URLs.
 import ctypes
+from contextlib import closing
 import logging
 from logging.handlers import RotatingFileHandler
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 from urllib.parse import urlencode
 
-# Give users a direct message when a required runtime package is unavailable.
 IMPORT_ERROR_MESSAGES = {
     "configparser": "configparser not installed.",
     "tkinter": "Tkinter not installed.",
+    "tkinter.filedialog": "Tkinter file dialog support is missing.",
     "win32print": "pywin32 printing support is missing.",
     "wmi": "wmi module is missing.",
     "qrcode": "qrcode module is missing.",
+    "pystray": "pystray is missing; install it with 'pip install pystray'.",
+    "PIL": "Pillow is missing; install it with 'pip install Pillow'.",
+    "PIL.Image": "Pillow image support is missing; install it with 'pip install Pillow'.",
+    "PIL.ImageDraw": "Pillow drawing support is missing; install it with 'pip install Pillow'.",
+    "PIL.ImageFont": "Pillow font support is missing; install it with 'pip install Pillow'.",
+    "roll_importer": "Voucher roll importer is missing.",
 }
 
 try:
     import configparser
     import tkinter as tk
+    from tkinter import filedialog
+    from PIL import Image, ImageDraw, ImageFont
+    import pystray
     import win32print
     import wmi
     import qrcode
+    from roll_importer import VoucherRollImporter
 except ImportError as exc:
     sys.exit(
         IMPORT_ERROR_MESSAGES.get(
@@ -42,6 +53,7 @@ SCRIPT_DIR = (
     else Path(__file__).resolve().parent
 )
 CONFIG_PATH = SCRIPT_DIR / "vouchers.ini"
+DATABASE_PATH = SCRIPT_DIR / "vouchers.db"
 LOG_PATH = SCRIPT_DIR / "wifivouchers.log"
 LOG_MAX_BYTES = 1_048_576
 LOG_BACKUP_COUNT = 3
@@ -53,21 +65,17 @@ _instance_kernel32 = None
 
 # This template is written beside the app when its configuration is missing.
 DEFAULT_INI_TEMPLATE = '''[DEFAULT]
-roll = roll.txt
 header = Wifi Voucher
 https_address = example.com
 zone_name = Example WiFi
 redir_url = https://example.com
 url_scheme = https
 logging_enabled = true
+start_minimized = false
+compact_database = false
 
 [PRINTER SETTINGS]
 printer = Epson
-fonttype =
-fontsize = 24
-x = 0
-y = 0
-th = 0
 
 [WINDOW]
 x = 10
@@ -85,6 +93,15 @@ ESC_POS_LEFT_ALIGN = b"\x1b\x61\x00"
 ESC_POS_FEED_AND_CUT = b"\n\n\x1d\x56\x41\x00"
 MAX_QR_WIDTH_DOTS = 384
 MAX_QR_DOTS_PER_MODULE = 4
+PRINT_WIDTH_DOTS = 384
+PRINT_MARGIN_DOTS = 8
+PRINT_TOP_MARGIN_DOTS = 102
+PRINT_END_MARGIN_DOTS = 203
+PRINT_TEXT_SIZE = 36
+PRINT_LINE_GAP = 6
+WM_QUERYENDSESSION = 0x0011
+WM_ENDSESSION = 0x0016
+GWL_WNDPROC = -4
 DEFAULT_WINDOW_POSITION = (10, 10)
 
 
@@ -93,51 +110,49 @@ class VoucherApp:
     def __init__(self, settings):
         self.settings = settings
         self.window = None
+        self.buttons = []
+        self.message_bar = None
+        self.tray_icon = None
+        self.roll_importer = VoucherRollImporter(DATABASE_PATH)
+        self._shutdown_window_proc = None
+        self._original_window_proc = None
+        self._call_window_proc = None
 
     def show_message(self, title, text, style=0):
         return show_message(title, text, style)
 
-    # Read one voucher, verify the printer, and remove the code only after confirmation.
+    # Read one voucher, verify the printer, and mark it printed after confirmation.
     def get_voucher_code(self):
-        voucher_path = SCRIPT_DIR / self.settings["roll"]
+        roll_number = self.settings.get("roll_number")
+        if roll_number is None:
+            self.show_message(
+                "Import Roll Required",
+                "Import a voucher roll before printing.",
+                0,
+            )
+            return
 
         try:
-            with voucher_path.open("r", encoding="utf-8") as voucher_file:
-                voucher_lines = voucher_file.read().splitlines()
-        except FileNotFoundError:
-            logger.error("Voucher roll file not found: %s", voucher_path)
+            voucher = self.roll_importer.get_next_voucher(roll_number)
+        except sqlite3.Error as exc:
+            logger.exception("Unable to read voucher roll from the database")
             self.show_message(
-                "Voucher Roll Error",
-                f"Voucher roll file not found:\n{voucher_path}",
-                0,
-            )
-            return
-        except OSError as exc:
-            logger.exception("Unable to read voucher roll file: %s", voucher_path)
-            self.show_message(
-                "Voucher Roll Error",
-                f"Unable to read voucher roll file:\n{voucher_path}\n\n{exc}",
+                "Voucher Database Error",
+                f"Unable to read voucher roll from the database:\n{exc}",
                 0,
             )
             return
 
-        row_index = None
-        voucher_code = None
-        for index, line in enumerate(voucher_lines):
-            if line.startswith('"'):
-                row_index = index
-                voucher_code = line.replace('"', "").strip()
-                break
-
-        if row_index is None or not voucher_code:
-            logger.warning("No voucher codes found in roll file: %s", voucher_path)
+        if voucher is None:
+            logger.info("No unprinted vouchers remain in roll %s", roll_number)
             self.show_message(
                 "Voucher Roll Empty",
-                f"No voucher codes found in the roll file:\n{voucher_path}",
+                f"No unprinted voucher codes remain in roll {roll_number}.",
                 0,
             )
             return
 
+        voucher_id, voucher_code = voucher
         try:
             printer_status = check_printer_online(self.settings["printer"])
         except Exception as exc:
@@ -178,52 +193,54 @@ class VoucherApp:
         if not printed:
             return
 
-        voucher_lines.pop(row_index)
-
         response = self.show_message(
             "Print Voucher Codes",
             "If voucher printed then click OK otherwise click cancel",
             1,
         )
-
         if response == 1:
-            temporary_path = None
             try:
-                with tempfile.NamedTemporaryFile(
-                    mode="w",
-                    encoding="utf-8",
-                    dir=voucher_path.parent,
-                    prefix=f".{voucher_path.name}.",
-                    suffix=".tmp",
-                    delete=False,
-                ) as voucher_file:
-                    temporary_path = Path(voucher_file.name)
-                    voucher_file.writelines(f"{line}\n" for line in voucher_lines)
-                os.replace(temporary_path, voucher_path)
-            except OSError as exc:
-                logger.exception("Unable to save updated voucher roll: %s", voucher_path)
-                if temporary_path is not None:
-                    try:
-                        temporary_path.unlink()
-                    except FileNotFoundError:
-                        pass
-                    except OSError:
-                        logger.exception(
-                            "Unable to remove temporary voucher roll file: %s",
-                            temporary_path,
-                        )
+                marked_printed = self.roll_importer.mark_printed(
+                    roll_number, voucher_id
+                )
+            except sqlite3.Error as exc:
+                logger.exception(
+                    "Unable to mark voucher %s from roll %s as printed",
+                    voucher_id,
+                    roll_number,
+                )
                 self.show_message(
-                    "Voucher Roll Save Error",
-                    "The voucher was printed, but the voucher roll could not be updated. "
-                    "The voucher remains in the roll and could print again if retried.\n\n"
-                    f"File: {voucher_path}\nError: {exc}",
+                    "Voucher Database Error",
+                    "The voucher was printed, but the database could not be updated. "
+                    "It may print again if retried.\n\n"
+                    f"Error: {exc}",
                     0,
                 )
+                return
+
+            if not marked_printed:
+                logger.warning(
+                    "Voucher %s in roll %s was not marked printed",
+                    voucher_id,
+                    roll_number,
+                )
+                self.show_message(
+                    "Voucher Database Warning",
+                    "The voucher was printed, but its database record was already "
+                    "updated or could not be found.",
+                    0,
+                )
+            else:
+                self.refresh_available_status()
 
     # Prepare the receipt and submit it to the configured printer.
     def ticket_print(self, print_voucher_code):
         lines = self.settings["header"].split("\n")
-        lines.extend(print_voucher_code.split("\n\n"))
+        lines.extend(("", "", ""))
+        lines.extend(
+            "".join(code_line)
+            for code_line in print_voucher_code.split("\n\n")
+        )
 
         try:
             voucher_url = build_voucher_url(print_voucher_code, self.settings)
@@ -242,18 +259,230 @@ class VoucherApp:
     def print_vouchers(self):
         self.get_voucher_code()
 
-    def kill_app(self):
+    def handle_return_key(self, _event):
+        self.print_vouchers()
+        return "break"
+
+    def minimize_to_tray(self):
+        if self.window is not None:
+            self.window.withdraw()
+
+    def restore_window(self):
+        if self.window is not None and self.window.winfo_exists():
+            self.window.deiconify()
+            self.window.lift()
+            self.window.focus_force()
+
+    def start_tray(self):
+        self.tray_icon = pystray.Icon(
+            "WifiVoucherCodes",
+            Image.new("RGB", (32, 32), color="#ff0000"),
+            "Wifi Voucher Codes",
+            menu=pystray.Menu(
+                pystray.MenuItem(
+                    "Restore",
+                    self._tray_restore,
+                    default=True,
+                ),
+                pystray.MenuItem(
+                    "Print Voucher Code",
+                    self._tray_print_voucher,
+                ),
+                pystray.MenuItem(
+                    "Exit",
+                    self._tray_exit,
+                ),
+            ),
+        )
+        self.tray_icon.run_detached()
+
+    def _tray_restore(self, _icon, _item):
+        if self.window is not None:
+            self.window.after(0, self.restore_window)
+
+    def _tray_print_voucher(self, _icon, _item):
+        if self.window is not None:
+            self.window.after(0, self.print_vouchers)
+
+    def _tray_exit(self, _icon, _item):
+        if self.window is not None:
+            self.window.after(0, self.kill_app)
+
+    def import_roll(self):
+        selected_path = filedialog.askopenfilename(
+            title="Select voucher roll",
+            initialdir=str(SCRIPT_DIR),
+            filetypes=[("CSV files", "*.csv"), ("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not selected_path:
+            return
+
+        result = None
+        available_count = None
+        self.set_importing(True)
+        try:
+            try:
+                (
+                    roll_number,
+                    imported_count,
+                    duplicate_count,
+                    available_count,
+                ) = self.roll_importer.import_roll(selected_path)
+            except (OSError, UnicodeError, ValueError, sqlite3.Error) as exc:
+                logger.exception("Unable to import voucher roll: %s", selected_path)
+                result = (
+                    "Import Roll Error",
+                    f"Unable to import the selected voucher roll:\n{selected_path}\n\n{exc}",
+                )
+            else:
+                self.settings["roll_number"] = roll_number
+                try:
+                    save_active_roll_number(roll_number)
+                except (OSError, configparser.Error) as exc:
+                    logger.exception("Unable to save active voucher roll number")
+                    result = (
+                        "Import Roll Warning",
+                        f"{imported_count} new voucher codes were imported and "
+                        f"{duplicate_count} duplicates were found for roll {roll_number}. "
+                        f"The codes were saved to the database "
+                        "but the active roll could not be saved "
+                        "to the configuration file. This roll is active until the app closes.\n\n"
+                        f"{exc}",
+                    )
+                else:
+                    result = (
+                        "Import Roll",
+                        f"Imported {imported_count} new voucher codes and found "
+                        f"{duplicate_count} duplicates in roll {roll_number}.",
+                    )
+        finally:
+            self.set_importing(False)
+
+        self.refresh_available_status()
+        self.show_message(result[0], result[1], 0)
+
+    def set_importing(self, importing):
+        button_state = tk.DISABLED if importing else tk.NORMAL
+        for button in self.buttons:
+            button.configure(state=button_state)
+
+        if importing:
+            self.set_message_bar("Import in progress...")
+        if self.window is not None:
+            self.window.update_idletasks()
+
+    def set_message_bar(self, message):
+        if self.message_bar is not None:
+            self.message_bar.configure(text=message)
+        if self.window is not None:
+            self.window.update_idletasks()
+
+    def refresh_available_status(self):
+        try:
+            available_count = self.roll_importer.get_available_count()
+        except sqlite3.Error:
+            logger.exception("Unable to count available vouchers in the database")
+            self.set_message_bar("Available voucher count is unavailable.")
+            return
+
+        self.set_message_bar(f"Vouchers available: {available_count}")
+
+    def kill_app(self, show_warnings=True):
+        if self.tray_icon is not None:
+            try:
+                self.tray_icon.stop()
+            except Exception as exc:
+                logger.exception("Unable to stop tray icon")
+                if show_warnings:
+                    self.show_message(
+                        "Tray Cleanup Warning",
+                        "The app will close, but the tray icon could not be removed:\n"
+                        f"{exc}",
+                        0,
+                    )
+            self.tray_icon = None
+
         if self.window is not None and self.window.winfo_exists():
             try:
                 save_window_position(*get_window_geometry_position(self.window))
             except (OSError, ValueError) as exc:
                 logger.exception("Unable to save window position")
-                self.show_message(
-                    "Window Position Warning",
-                    f"The window position could not be saved. The app will still close.\n\n{exc}",
-                    0,
-                )
+                if show_warnings:
+                    self.show_message(
+                        "Window Position Warning",
+                        "The window position could not be saved. "
+                        f"The app will still close.\n\n{exc}",
+                        0,
+                    )
             self.window.destroy()
+
+    def install_windows_shutdown_handler(self):
+        if os.name != "nt" or self.window is None:
+            return
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        set_window_proc = getattr(
+            user32,
+            "SetWindowLongPtrW" if ctypes.sizeof(ctypes.c_void_p) == 8 else "SetWindowLongW",
+        )
+        set_window_proc.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_void_p,
+        )
+        set_window_proc.restype = ctypes.c_void_p
+
+        self._call_window_proc = user32.CallWindowProcW
+        self._call_window_proc.argtypes = (
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint,
+            ctypes.c_size_t,
+            ctypes.c_ssize_t,
+        )
+        self._call_window_proc.restype = ctypes.c_ssize_t
+
+        callback_type = ctypes.WINFUNCTYPE(
+            ctypes.c_ssize_t,
+            ctypes.c_void_p,
+            ctypes.c_uint,
+            ctypes.c_size_t,
+            ctypes.c_ssize_t,
+        )
+        self._shutdown_window_proc = callback_type(
+            self.handle_windows_shutdown_message
+        )
+        callback_address = ctypes.cast(
+            self._shutdown_window_proc, ctypes.c_void_p
+        )
+        ctypes.set_last_error(0)
+        original_proc = set_window_proc(
+            self.window.winfo_id(),
+            GWL_WNDPROC,
+            callback_address,
+        )
+        if not original_proc:
+            error_code = ctypes.get_last_error()
+            self._shutdown_window_proc = None
+            self._call_window_proc = None
+            raise ctypes.WinError(error_code)
+        self._original_window_proc = original_proc
+
+    def handle_windows_shutdown_message(self, hwnd, message, wparam, lparam):
+        if message == WM_QUERYENDSESSION:
+            return 1
+        if message == WM_ENDSESSION and wparam:
+            self.kill_app(show_warnings=False)
+            return 0
+        if self._original_window_proc is None or self._call_window_proc is None:
+            return 0
+        return self._call_window_proc(
+            self._original_window_proc,
+            hwnd,
+            message,
+            wparam,
+            lparam,
+        )
 
     def show_about(self):
         self.show_message(
@@ -268,31 +497,82 @@ class VoucherApp:
     def build_main_window(self):
         window_x, window_y = load_window_position()
         self.window = tk.Tk()
-        self.window.title("Wifi Voucher Codes")
-        self.window.geometry(f"170x200{window_x:+d}{window_y:+d}")
+        self.window.title("Wifi Vouchers")
+        self.window.geometry(f"170x345{window_x:+d}{window_y:+d}")
+        self.window.resizable(False, False)
         self.window.protocol("WM_DELETE_WINDOW", self.kill_app)
 
-        buttons = (
-            ("Print Voucher", "blue", self.print_vouchers, 20),
-            ("Open config", "green", edit_ini_file, 60),
-            ("Exit", "red", self.kill_app, 100),
-            ("About", "purple", self.show_about, 140),
+        title_label = tk.Label(
+            self.window,
+            text="Wifi Vouchers",
+            font=("Arial", 12, "bold"),
         )
-        for text, color, command, y_position in buttons:
-            tk.Button(
+        title_label.place(x=5, y=0, width=160, height=35)
+
+        buttons = (
+            ("Print Voucher", "blue", self.print_vouchers, 40, 2),
+            ("Import Roll", "green", self.import_roll, 100, 1),
+            ("Open config", "green", edit_ini_file, 140, 1),
+            ("Minimize", "red", self.minimize_to_tray, 180, 1),
+            ("Exit", "red", self.kill_app, 220, 1),
+            ("About", "purple", self.show_about, 260, 1),
+        )
+        self.buttons = []
+        for text, color, command, y_position, height in buttons:
+            button = tk.Button(
                 self.window,
                 text=text,
                 width=15,
+                height=height,
                 fg=color,
                 command=command,
-            ).place(x=30, y=y_position)
+            )
+            button.place(x=30, y=y_position)
+            button.bind("<Return>", self.handle_return_key)
+            self.buttons.append(button)
+
+        self.message_bar = tk.Label(
+            self.window,
+            text="",
+            anchor=tk.W,
+            justify=tk.LEFT,
+            relief=tk.SUNKEN,
+            padx=4,
+            wraplength=145,
+        )
+        self.message_bar.place(x=5, y=295, width=160, height=45)
+        self.refresh_available_status()
 
         self.window.bind("<Escape>", self.close_and_exit)
+        self.window.bind("x", self.close_and_exit)
         self.window.bind("p", lambda _event: self.print_vouchers())
+        self.window.bind("<Return>", self.handle_return_key)
+        try:
+            self.install_windows_shutdown_handler()
+        except (OSError, AttributeError) as exc:
+            logger.exception("Unable to register Windows shutdown handler")
+            self.show_message(
+                "Windows Shutdown Handler Error",
+                "Windows shutdown notifications could not be registered. "
+                f"The app may not close gracefully during shutdown.\n\n{exc}",
+                0,
+            )
         return self.window
 
     def main(self):
         self.build_main_window()
+        try:
+            self.start_tray()
+        except Exception as exc:
+            logger.exception("Unable to start the system tray icon")
+            self.show_message(
+                "Tray Startup Error",
+                f"The system tray icon could not be started:\n{exc}",
+                0,
+            )
+        else:
+            if self.settings["start_minimized"]:
+                self.minimize_to_tray()
         self.window.mainloop()
 
 
@@ -364,6 +644,74 @@ def save_window_position(x_position, y_position):
         raise
 
 
+def save_active_roll_number(roll_number):
+    ensure_config_file()
+    parser = configparser.ConfigParser()
+    if not parser.read(CONFIG_PATH):
+        raise FileNotFoundError(f"Unable to locate configuration file: {CONFIG_PATH}")
+
+    parser["DEFAULT"]["roll_number"] = str(roll_number)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=CONFIG_PATH.parent,
+            prefix=f".{CONFIG_PATH.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as config_file:
+            temporary_path = Path(config_file.name)
+            parser.write(config_file)
+        os.replace(temporary_path, CONFIG_PATH)
+    except OSError:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.exception(
+                    "Unable to remove temporary config file: %s",
+                    temporary_path,
+                )
+        raise
+
+
+def save_compact_database_setting(enabled):
+    ensure_config_file()
+    parser = configparser.ConfigParser()
+    if not parser.read(CONFIG_PATH):
+        raise FileNotFoundError(f"Unable to locate configuration file: {CONFIG_PATH}")
+
+    parser["DEFAULT"]["compact_database"] = str(enabled).lower()
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=CONFIG_PATH.parent,
+            prefix=f".{CONFIG_PATH.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as config_file:
+            temporary_path = Path(config_file.name)
+            parser.write(config_file)
+        os.replace(temporary_path, CONFIG_PATH)
+    except OSError:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                logger.exception(
+                    "Unable to remove temporary config file: %s",
+                    temporary_path,
+                )
+        raise
+
+
 # Load application settings from vouchers.ini and convert numeric fields.
 def load_settings():
     ensure_config_file()
@@ -373,7 +721,9 @@ def load_settings():
 
     try:
         return {
-            "roll": parser["DEFAULT"]["roll"],
+            "roll_number": parser.getint(
+                "DEFAULT", "roll_number", fallback=None
+            ),
             "header": parser["DEFAULT"]["header"],
             "https_address": parser.get("DEFAULT", "https_address", fallback=""),
             "zone_name": parser.get("DEFAULT", "zone_name", fallback=""),
@@ -384,12 +734,13 @@ def load_settings():
             "logging_enabled": parser.getboolean(
                 "DEFAULT", "logging_enabled", fallback=True
             ),
+            "start_minimized": parser.getboolean(
+                "DEFAULT", "start_minimized", fallback=False
+            ),
+            "compact_database": parser.getboolean(
+                "DEFAULT", "compact_database", fallback=False
+            ),
             "printer": parser["PRINTER SETTINGS"]["printer"],
-            "font_type": parser["PRINTER SETTINGS"]["fonttype"],
-            "font_size": int(parser["PRINTER SETTINGS"]["fontsize"]),
-            "x": int(parser["PRINTER SETTINGS"]["x"]),
-            "y": int(parser["PRINTER SETTINGS"]["y"]),
-            "th": int(parser["PRINTER SETTINGS"]["th"]),
         }
     except (KeyError, ValueError) as exc:
         raise ValueError(
@@ -460,11 +811,11 @@ def print_printer_bytes(printer_name, data):
     return True
 
 
-# Convert QR modules into the raster format expected by the thermal printer.
-def build_qr_raster(qr_text):
+# Build a QR image at the largest size that fits the thermal printer width.
+def build_qr_image(qr_text):
     qr = qrcode.QRCode(
         error_correction=qrcode.constants.ERROR_CORRECT_L,
-        box_size=4,
+        box_size=1,
         border=4,
     )
     qr.add_data(qr_text)
@@ -476,34 +827,99 @@ def build_qr_raster(qr_text):
         min(MAX_QR_DOTS_PER_MODULE, MAX_QR_WIDTH_DOTS // module_count),
     )
     width = module_count * dots_per_module
-    height = width
+    image = Image.new("1", (width, width), 1)
+    draw = ImageDraw.Draw(image)
+    for module_y, module_row in enumerate(qr_modules):
+        for module_x, is_black in enumerate(module_row):
+            if is_black:
+                left = module_x * dots_per_module
+                top = module_y * dots_per_module
+                draw.rectangle(
+                    (
+                        left,
+                        top,
+                        left + dots_per_module - 1,
+                        top + dots_per_module - 1,
+                    ),
+                    fill=0,
+                )
+    return image
+
+
+# Convert a monochrome image into the ESC/POS GS v 0 raster command.
+def image_to_raster(image):
+    image = image.convert("1")
+    width, height = image.size
     row_bytes = (width + 7) // 8
     raster = bytearray()
+    pixels = image.load()
 
-    for module_row in qr_modules:
-        for _ in range(dots_per_module):
-            row = bytearray(row_bytes)
-            for module_x, is_black in enumerate(module_row):
-                if is_black:
-                    for horizontal_scale in range(dots_per_module):
-                        x_position = module_x * dots_per_module + horizontal_scale
-                        row[x_position // 8] |= 0x80 >> (x_position % 8)
-            raster.extend(row)
+    for y_position in range(height):
+        row = bytearray(row_bytes)
+        for x_position in range(width):
+            if pixels[x_position, y_position] == 0:
+                row[x_position // 8] |= 0x80 >> (x_position % 8)
+        raster.extend(row)
 
-    raster_header = (
+    return (
         b"\x1d\x76\x30\x00"
         + row_bytes.to_bytes(2, "little")
         + height.to_bytes(2, "little")
+        + raster
     )
-    return raster_header + raster
 
 
-# Add a centered QR image to the receipt stream.
-def append_qr_code(data, qr_text):
-    data.extend(b"\n\n")
-    data.extend(ESC_POS_CENTER)
-    data.extend(build_qr_raster(qr_text))
-    data.extend(ESC_POS_LEFT_ALIGN)
+# Convert QR modules into the raster format expected by the thermal printer.
+def build_qr_raster(qr_text):
+    return image_to_raster(build_qr_image(qr_text))
+
+
+def load_print_font():
+    for font_path in (
+        Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "arial.ttf",
+        Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts" / "calibri.ttf",
+    ):
+        try:
+            return ImageFont.truetype(str(font_path), PRINT_TEXT_SIZE)
+        except OSError:
+            continue
+    return ImageFont.load_default()
+
+
+# Render the complete receipt as one bitmap before sending it to the printer.
+def build_receipt_raster(lines, qr_data):
+    font = load_print_font()
+    text_lines = [line or "" for line in lines]
+    line_heights = []
+    for line in text_lines:
+        bounds = ImageDraw.Draw(Image.new("1", (1, 1))).textbbox(
+            (0, 0), line, font=font
+        )
+        line_heights.append(max(1, bounds[3] - bounds[1]))
+
+    qr_image = build_qr_image(qr_data)
+    text_height = sum(line_heights) + PRINT_LINE_GAP * max(0, len(text_lines) - 1)
+    image_height = (
+        PRINT_TOP_MARGIN_DOTS
+        + text_height
+        + PRINT_LINE_GAP * 2
+        + qr_image.height
+        + PRINT_MARGIN_DOTS
+        + PRINT_END_MARGIN_DOTS
+    )
+    image = Image.new("1", (PRINT_WIDTH_DOTS, image_height), 1)
+    draw = ImageDraw.Draw(image)
+    y_position = PRINT_TOP_MARGIN_DOTS
+    for line, line_height in zip(text_lines, line_heights):
+        bounds = draw.textbbox((0, 0), line, font=font)
+        text_width = bounds[2] - bounds[0]
+        x_position = (PRINT_WIDTH_DOTS - text_width) // 2 - bounds[0]
+        draw.text((x_position, y_position - bounds[1]), line, fill=0, font=font)
+        y_position += line_height + PRINT_LINE_GAP
+
+    y_position += PRINT_LINE_GAP
+    image.paste(qr_image, ((PRINT_WIDTH_DOTS - qr_image.width) // 2, y_position))
+    return image_to_raster(image)
 
 
 # Validate URL-related settings and encode voucher details into the login URL.
@@ -532,24 +948,12 @@ def build_voucher_url(voucher_code, settings):
     return f"{url_scheme}://{settings['https_address']}:8002/index.php?{query}"
 
 
-# Assemble text, QR code, and paper-cut commands into one receipt payload.
+# Assemble an all-raster receipt and paper-cut commands.
 def build_thermal_bytes(lines, qr_data):
     data = bytearray()
     data.extend(ESC_POS_INITIALIZE)
-    data.extend(ESC_POS_LINE_SPACING)
-    data.extend(ESC_POS_CENTER)
-    data.extend(ESC_POS_BOLD_ON)
-
-    for line in lines:
-        if not line:
-            data.extend(b"\n")
-            continue
-        data.extend(line.encode("cp1252", errors="ignore"))
-        data.extend(b"\n")
-
-    data.extend(ESC_POS_NORMAL_SIZE)
-    data.extend(ESC_POS_BOLD_OFF)
-    append_qr_code(data, qr_data)
+    data.extend(build_receipt_raster(lines, qr_data))
+    data.extend(b"\n\n")
     data.extend(ESC_POS_FEED_AND_CUT)
     return bytes(data)
 
@@ -564,6 +968,21 @@ def ensure_config_file():
     except OSError:
         logger.exception("Unable to create configuration file: %s", CONFIG_PATH)
         raise
+    return True
+
+
+# Reclaim unused SQLite pages before the application opens its database.
+def compact_voucher_database(database_path):
+    if not database_path.exists():
+        logger.info(
+            "Skipping database compaction because the database does not exist: %s",
+            database_path,
+        )
+        return False
+
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.execute("VACUUM")
+    logger.info("Compacted voucher database: %s", database_path)
     return True
 
 
@@ -704,6 +1123,21 @@ def main():
             show_message("Configuration Error", str(exc), 0)
             sys.exit(str(exc))
 
+        if settings["compact_database"]:
+            try:
+                compacted = compact_voucher_database(DATABASE_PATH)
+                if compacted:
+                    save_compact_database_setting(False)
+                    settings["compact_database"] = False
+            except (OSError, sqlite3.Error) as exc:
+                logger.exception("Unable to compact voucher database")
+                show_message(
+                    "Database Compaction Warning",
+                    "The voucher database could not be compacted. "
+                    f"The app will continue starting.\n\n{exc}",
+                    0,
+                )
+
         if created_default:
             logger.info("Created default configuration file: %s", CONFIG_PATH)
             show_message(
@@ -724,6 +1158,6 @@ def main():
         release_single_instance()
 
 
-# Run the app only when this file is launched directly.
+
 if __name__ == "__main__":
     main()
