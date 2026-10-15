@@ -66,9 +66,8 @@ _instance_kernel32 = None
 # This template is written beside the app when its configuration is missing.
 DEFAULT_INI_TEMPLATE = '''[DEFAULT]
 header = Wifi Voucher
-https_address = example.com
+server_address = example.com
 zone_name = Example WiFi
-redir_url = https://example.com
 url_scheme = https
 logging_enabled = true
 start_minimized = false
@@ -725,9 +724,8 @@ def load_settings():
                 "DEFAULT", "roll_number", fallback=None
             ),
             "header": parser["DEFAULT"]["header"],
-            "https_address": parser.get("DEFAULT", "https_address", fallback=""),
+            "server_address": parser.get("DEFAULT", "server_address", fallback=""),
             "zone_name": parser.get("DEFAULT", "zone_name", fallback=""),
-            "redir_url": parser.get("DEFAULT", "redir_url", fallback=""),
             "url_scheme": parser.get(
                 "DEFAULT", "url_scheme", fallback="http"
             ).strip().lower(),
@@ -922,9 +920,9 @@ def build_receipt_raster(lines, qr_data):
     return image_to_raster(image)
 
 
-# Validate URL-related settings and encode voucher details into the login URL.
+# Validate URL-related settings and encode voucher details into the pfSense login URL.
 def build_voucher_url(voucher_code, settings):
-    required_settings = ("https_address", "zone_name", "redir_url")
+    required_settings = ("server_address", "zone_name")
     missing_settings = [
         name for name in required_settings if not settings.get(name, "").strip()
     ]
@@ -941,11 +939,11 @@ def build_voucher_url(voucher_code, settings):
     query = urlencode(
         (
             ("zone", settings["zone_name"]),
-            ("redirurl", settings["redir_url"]),
-            ("voucher", voucher_code),
+            ("auth_voucher", voucher_code),
+            ("accept", "Connect"),
         )
     )
-    return f"{url_scheme}://{settings['https_address']}:8002/index.php?{query}"
+    return f"{url_scheme}://{settings['server_address']}:8002/index.php?{query}"
 
 
 # Assemble an all-raster receipt and paper-cut commands.
