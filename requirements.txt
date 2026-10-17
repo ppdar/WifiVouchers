@@ -1,0 +1,18 @@
+# WifiVouchers - Linux dependencies
+# Install with:  pip install -r requirements-linux.txt
+#
+# tkinter is NOT pip-installable on most distributions; install it with the
+# system package manager instead, e.g.:
+#     Debian/Ubuntu:  sudo apt install python3-tk
+#     Fedora:         sudo dnf install python3-tkinter
+#     Arch:           sudo pacman -S tk
+#
+# The CUPS command-line tools (lp / lpstat) are also recommended:
+#     Debian/Ubuntu:  sudo apt install cups cups-client
+#
+# pycups is optional (the app falls back to lp/lpstat without it) but gives
+# more reliable printer status reporting:
+pycups>=2.0
+pillow>=9.0
+qrcode>=7.0
+pystray>=0.19
