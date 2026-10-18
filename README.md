@@ -19,4 +19,4 @@ To run on Linux desktop (64-bit) you need to have all required python libraries 
 
 When installing printer types in Linux use GENERIC then RAW QUEUE and make sure the port selection is correct.
 
-To run type: python3 -m WifiVouchers
+To run type: python -m WifiVouchers
