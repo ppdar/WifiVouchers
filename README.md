@@ -17,6 +17,6 @@ WifiVouchers has been compiled for Windows 32-bit and should work for all Window
 Linux notes:
 To run on Linux desktop (64-bit) you need to have all required python libraries pre-installed. Go to the directory of WifiVouchers then: pip install -r requirements.txt
 
-When installing printer types in Linux use GENERIC then RAW QUEUE and make sure the port selection is correct.
+When installing printer types in Linux choose GENERIC then RAW QUEUE for generic esc/POS thermal printers and make sure your port selection is correct eg. USB001.
 
-To run type: python -m WifiVouchers
+To run from a bash terminal change to the directory and type: python -m WifiVouchers
